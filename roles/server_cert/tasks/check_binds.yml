@@ -1,0 +1,36 @@
+---
+# This file reads the running config of each node in __server_cert_check_nodes. Each field in
+# __server_cert_check_fields must bind __server_cert_check_name. On a failed read or another bound
+# value, the role stops. The message names the node and the bound value.
+- name: Check | read the binds on each node for {{ __server_cert_check_name }}
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ __server_cert_read_sshpass }}
+    FAIL=0
+    {% for field in __server_cert_check_fields %}
+    OUT=$(timeout 20 {{ __server_cert_ssh }} {{ item.ip | quote }} {{ ('show running-config | include ' ~ field) | quote }} 2>&1) || \
+      { echo "The running-config read failed: $OUT"; exit 1; }
+    if ! grep -qF {{ (field ~ ' "' ~ __server_cert_check_name ~ '"') | quote }} <<< "$OUT"; then
+      BOUND=$(grep -F {{ (field ~ ' ') | quote }} <<< "$OUT" | awk '{print $2}' | head -1)
+      echo {{ field | quote }} "binds ${BOUND:-nothing}. The current name is" {{ (__server_cert_check_name ~ '.') | quote }}
+      FAIL=1
+    fi
+    {% endfor %}
+    exit $FAIL
+  args:
+    executable: /bin/bash
+    stdin: "{{ __server_cert_pass }}"
+  register: __server_cert_checked
+  loop: "{{ __server_cert_check_nodes }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Check | stop when a node does not bind {{ __server_cert_check_name }}
+  ansible.builtin.fail:
+    msg: >-
+      {% for r in __server_cert_checked.results | rejectattr('rc', 'eq', 0) %}{{ r.item.name }} ({{ r.item.ip }}):
+      {{ r.stdout_lines | join(' ') }} {% endfor %}{{ __server_cert_check_note | default('') }}
+  when: __server_cert_checked.results | rejectattr('rc', 'eq', 0) | list | length > 0

@@ -1,0 +1,69 @@
+---
+# A delete replays to members where a bind can lag. A member that still references the name then
+# fails to apply the config. The role checks every node for a reference first. Any running-config
+# line with the name counts, except its own crypto-local pki ServerCert line. A node that fails
+# the read, or that does not print the "Building Configuration" banner, also counts as a reference.
+# The role deletes one name per write memory and waits for convergence before the next.
+- name: Cleanup | reference check on every node for {{ __server_cert_stale_name }}
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ __server_cert_read_sshpass }}
+    NAME={{ __server_cert_stale_name | quote }}
+    OUT=$(timeout 20 {{ __server_cert_ssh }} {{ item.ip | quote }} "show running-config | include $NAME" 2>&1) || \
+      { echo "UNREACHABLE: $OUT"; exit 1; }
+    echo "$OUT"
+    grep -q 'Building Configuration' <<< "$OUT" || { echo "NO RUNNING-CONFIG BANNER"; exit 1; }
+    REFS=$(grep -F -- "$NAME" <<< "$OUT" | grep -v -i -E "^[[:space:]]*crypto-local pki servercert $NAME([[:space:]]|\$)") || true
+    if [ -n "$REFS" ]; then echo "REFERENCED: $REFS"; exit 1; fi
+    exit 0
+  args:
+    executable: /bin/bash
+    stdin: "{{ __server_cert_pass }}"
+  register: __server_cert_refs
+  loop: "{{ __server_cert_path.nodes }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Cleanup | nodes that reference {{ __server_cert_stale_name }}
+  ansible.builtin.set_fact:
+    __server_cert_ref_nodes: "{{ __server_cert_refs.results | default([]) | rejectattr('rc', 'eq', 0) | map(attribute='item.name') | list }}"
+
+- name: Cleanup | keep {{ __server_cert_stale_name }}
+  ansible.builtin.debug:
+    msg: >-
+      {{ __server_cert_stale_name }} at {{ __server_cert_path.path }} stays this run.
+      {{ ('References or failed reads on ' ~ (__server_cert_ref_nodes | join(', ')) ~ '.')
+      if __server_cert_ref_nodes else 'The path has no nodes.' }}
+  when: __server_cert_ref_nodes | length > 0 or __server_cert_path.nodes | length == 0
+
+- name: Cleanup | delete {{ __server_cert_stale_name }}
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ __server_cert_read_sshpass }}
+    printf '%s\n' 'configure terminal' {{ ('cd ' ~ __server_cert_path.path) | quote }} \
+      {{ ('no crypto-local pki serverCert ' ~ __server_cert_stale_name) | quote }} 'write memory' |
+      timeout 30 {{ __server_cert_ssh }} {{ server_cert_conductor | quote }} 2>&1
+  args:
+    executable: /bin/bash
+    stdin: "{{ __server_cert_pass }}"
+  register: __server_cert_delete
+  changed_when: true
+  failed_when: false
+  no_log: true
+  when: __server_cert_ref_nodes | length == 0 and __server_cert_path.nodes | length > 0
+
+- name: Cleanup | stop when the delete failed for {{ __server_cert_stale_name }}
+  ansible.builtin.fail:
+    msg: "The delete of {{ __server_cert_stale_name }} failed at {{ __server_cert_path.path }}. The device printed: {{ __server_cert_delete.stdout }}"
+  when: >-
+    __server_cert_delete is not skipped and (__server_cert_delete.rc != 0 or
+    (__server_cert_delete.stdout | default('') | regex_search(__server_cert_cli_error)) is not none)
+
+- name: Cleanup | converge gate after the delete of {{ __server_cert_stale_name }}
+  ansible.builtin.include_tasks: converge_gate.yml
+  vars:
+    __server_cert_gate_ips: "{{ __server_cert_path.nodes | map(attribute='ip') | list }}"
+  when: __server_cert_delete is not skipped

@@ -1,0 +1,68 @@
+---
+# A node normally restarts httpd by itself after the bind reaches it. The forced restart is the
+# fallback. A restart drops the web UI and the captive portal on this node for about 20 seconds.
+- name: Restart | wait for the store certificate on {{ __server_cert_node.name }}
+  ansible.builtin.shell: |
+    set -o pipefail
+    timeout 10 openssl s_client -connect {{ (__server_cert_node.ip ~ ':' ~ server_cert_port) | quote }} \
+      -servername {{ server_cert_conductor | quote }} </dev/null 2>/dev/null | openssl x509 -fingerprint -sha256 -noout
+  args:
+    executable: /bin/bash
+  register: __server_cert_served
+  changed_when: false
+  failed_when: false
+  retries: 20  # measured 0-1s when the node restarts httpd by itself, ceiling 60s
+  delay: 3
+  until: (__server_cert_served.stdout | default('') | regex_replace('^.*Fingerprint=', '') | trim) == __server_cert_store_fp
+
+- name: Restart | served fingerprint of {{ __server_cert_node.name }}
+  ansible.builtin.set_fact:
+    __server_cert_served_fp: "{{ __server_cert_served.stdout | default('') | regex_replace('^.*Fingerprint=', '') | trim }}"
+
+# A restart cannot fix a closed port or a failed TLS handshake, so the role stops.
+- name: Restart | stop on an empty read from {{ __server_cert_node.name }}
+  ansible.builtin.fail:
+    msg: >-
+      {{ __server_cert_node.name }} ({{ __server_cert_node.ip }}) returned no certificate on port {{ server_cert_port }} for 60 seconds.
+      The port is closed or the TLS handshake failed. The role did not restart httpd on this node.
+  when: __server_cert_served_fp | length == 0
+
+# A restart changes what the node serves only when its config binds the current name on
+# switch-cert. On another bound value, the role stops and does not restart httpd.
+- name: Restart | the config binds the current name on switch-cert on {{ __server_cert_node.name }}
+  ansible.builtin.include_tasks: check_binds.yml
+  vars:
+    __server_cert_check_nodes: ["{{ __server_cert_node }}"]
+    __server_cert_check_fields: [switch-cert]
+    __server_cert_check_name: "{{ __server_cert_restart_name }}"
+    __server_cert_check_note: The role did not restart httpd on this node.
+  when: __server_cert_served_fp != __server_cert_store_fp
+
+# A node other than the conductor ignores a command on an ssh session without a pty. It still
+# returns rc 0, so this task uses ssh -tt. The restart asks y/n, and the second input line answers it.
+- name: Restart | force an httpd restart on {{ __server_cert_node.name }}
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ __server_cert_read_sshpass }}
+    printf '%s\n' 'process restart httpd' 'y' | timeout 20 {{ __server_cert_ssh }} -tt {{ __server_cert_node.ip | quote }}
+  args:
+    executable: /bin/bash
+    stdin: "{{ __server_cert_pass }}"
+  changed_when: true
+  no_log: true
+  when: __server_cert_served_fp != __server_cert_store_fp
+
+- name: Restart | the store certificate after the forced restart on {{ __server_cert_node.name }}
+  ansible.builtin.shell: |
+    set -o pipefail
+    timeout 10 openssl s_client -connect {{ (__server_cert_node.ip ~ ':' ~ server_cert_port) | quote }} \
+      -servername {{ server_cert_conductor | quote }} </dev/null 2>/dev/null | openssl x509 -fingerprint -sha256 -noout
+  args:
+    executable: /bin/bash
+  register: __server_cert_served_after
+  changed_when: false
+  retries: 10  # measured ~20s for httpd to come back, ceiling 30s
+  delay: 3
+  until: (__server_cert_served_after.stdout | default('') | regex_replace('^.*Fingerprint=', '') | trim) == __server_cert_store_fp
+  failed_when: (__server_cert_served_after.stdout | default('') | regex_replace('^.*Fingerprint=', '') | trim) != __server_cert_store_fp
+  when: __server_cert_served_fp != __server_cert_store_fp

@@ -1,0 +1,27 @@
+---
+namespace: samwiseg0
+name: aruba_cert
+version: 1.0.0
+readme: README.md
+authors:
+  - samwiseg0
+description: Push a TLS server certificate to an Aruba Mobility Conductor cluster that runs ArubaOS 8.
+license:
+  - GPL-3.0-or-later
+tags:
+  - networking
+  - security
+  - aruba
+  - certificates
+dependencies: {}
+repository: https://github.com/samwiseg0/ansible-collection-aruba-cert
+homepage: https://github.com/samwiseg0/ansible-collection-aruba-cert
+issues: https://github.com/samwiseg0/ansible-collection-aruba-cert/issues
+build_ignore:
+  - .github
+  - .gitignore
+  - .yamllint
+  - .ansible-lint
+  - .ansible
+  - "*.tar.gz"
+  - tests/output

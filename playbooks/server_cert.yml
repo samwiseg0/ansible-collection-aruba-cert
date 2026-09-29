@@ -1,0 +1,9 @@
+---
+# Report:  ansible-playbook samwiseg0.aruba_cert.server_cert -e @aruba_cert.yml
+# Apply:   ansible-playbook samwiseg0.aruba_cert.server_cert -e @aruba_cert.yml -e server_cert_apply=true -K
+- name: Push a TLS server certificate to an Aruba Mobility Conductor cluster
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  roles:
+    - role: samwiseg0.aruba_cert.server_cert

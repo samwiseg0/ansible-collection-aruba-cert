@@ -1,0 +1,16 @@
+---
+# Required variables have no default. See meta/argument_specs.yml or
+# ansible-doc -t role samwiseg0.aruba_cert.server_cert.
+server_cert_apply: false
+server_cert_port: 4343
+server_cert_validate_certs: true
+server_cert_ca_path: ""
+server_cert_ssh_known_hosts: ""
+server_cert_cleanup: true
+
+# An empty server_cert_scp_user selects the temp account mode.
+server_cert_scp_user: ""
+server_cert_scp_password: ""
+server_cert_scp_dir: ""
+server_cert_scp_delegate: ""
+server_cert_temp_user: certdrop

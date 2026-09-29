@@ -1,0 +1,150 @@
+---
+argument_specs:
+  main:
+    short_description: Push a TLS server certificate to an Aruba Mobility Conductor cluster.
+    description:
+      - The role imports a PEM certificate and key as a ServerCert at each configured path. It binds the ServerCert to the web server profile.
+      - The role discovers the cluster nodes on every run. It checks each write step before the next one. The register and bind checks cover every node.
+      - The role only reports by default. It writes only with O(server_cert_apply=true) and without check mode.
+      - The role runs on the control node. It reaches the conductor and every node over ssh and the REST API.
+    author:
+      - samwiseg0
+    options:
+      server_cert_apply:
+        type: bool
+        default: false
+        description:
+          - Write to the cluster. When false, the role only reports.
+          - Check mode always reports, even when this is true.
+      server_cert_conductor:
+        type: str
+        required: true
+        description:
+          - Host name or address of the conductor VIP. The role sends ssh and REST API requests to it.
+          - The role also uses it as the TLS server name when it reads a served certificate.
+      server_cert_username:
+        type: str
+        required: true
+        description:
+          - Management user for ssh and the REST API. The same user and password must work on every node.
+          - Letters, digits, dot, underscore and dash only.
+      server_cert_password:
+        type: str
+        required: true
+        no_log: true
+        description:
+          - Password of O(server_cert_username).
+      server_cert_port:
+        type: int
+        default: 4343
+        description:
+          - HTTPS port of the REST API and of the web server on each node.
+      server_cert_validate_certs:
+        type: bool
+        default: true
+        description:
+          - Validate the TLS certificate of the REST API.
+          - Set it to false for the first run against a factory certificate.
+          - When false, the role sends the password to any server that answers on the conductor address.
+      server_cert_ca_path:
+        type: path
+        default: ""
+        description:
+          - PEM file with the CA certificates that the REST API check trusts.
+          - An empty value uses the system trust store.
+      server_cert_ssh_known_hosts:
+        type: path
+        default: ""
+        description:
+          - known_hosts file with the host key of the conductor VIP and of every node.
+          - When set, ssh uses this file and refuses an unknown host key.
+          - An empty value makes ssh accept the host key of a node on first contact.
+      server_cert_fullchain:
+        type: path
+        required: true
+        description:
+          - Absolute path of the PEM file on the control node with the certificate and its chain.
+      server_cert_privkey:
+        type: path
+        required: true
+        description:
+          - Absolute path of the PEM file on the control node with the private key.
+      server_cert_name_prefix:
+        type: str
+        required: true
+        description:
+          - Prefix of the ServerCert names. Letters and digits only.
+          - A name is C(<prefix>_<YYYYMMDD>_<suffix>). The date is the notAfter date of the certificate in UTC.
+          - Cleanup deletes unbound certificates with this prefix and an older date. Pick a prefix that nothing else uses.
+      server_cert_paths:
+        type: list
+        elements: dict
+        required: true
+        description:
+          - The config paths that bind the certificate.
+        options:
+          path:
+            type: str
+            required: true
+            description:
+              - Config path, for example C(/mm) or C(/md/<group>).
+          suffix:
+            type: str
+            required: true
+            description:
+              - Last part of the ServerCert name. Letters and digits only. Each item needs a different suffix. The check ignores case.
+          bind_fields:
+            type: list
+            elements: str
+            required: true
+            choices:
+              - switch-cert
+              - captive-portal-cert
+            description:
+              - The web server profile fields to bind at this path.
+              - The served certificate check runs only on a path that binds V(switch-cert). It restarts httpd on a node that serves another certificate.
+              - Before the restart, the check reads the node config. The role stops if the node config does not bind the current name.
+              - On a path without V(switch-cert), the role checks the binds by config only. It never restarts httpd on the nodes of that path.
+      server_cert_cleanup:
+        type: bool
+        default: true
+        description:
+          - After the push, delete unbound ServerCert names with O(server_cert_name_prefix).
+          - Cleanup also runs when no path needs a push.
+          - Cleanup keeps a name that either web server profile field binds. This includes a field that the item does not list in bind_fields.
+      server_cert_scp_host:
+        type: str
+        required: true
+        description:
+          - Host name or address that the conductor uses to reach the scp host over scp.
+          - In the temp account mode, this is an address of the control node.
+      server_cert_scp_user:
+        type: str
+        default: ""
+        description:
+          - An empty value selects the temp account mode. The role then creates a temp account on the control node for each upload.
+          - A value selects the remote scp host mode. The conductor logs in to O(server_cert_scp_host) as this scp user.
+      server_cert_scp_password:
+        type: str
+        default: ""
+        no_log: true
+        description:
+          - Password of O(server_cert_scp_user). The remote scp host mode needs it.
+      server_cert_scp_dir:
+        type: str
+        default: ""
+        description:
+          - Absolute directory on the scp host for the p12. The remote scp host mode needs it. The directory must exist.
+      server_cert_scp_delegate:
+        type: str
+        default: ""
+        description:
+          - Inventory host that the role copies the p12 to in the remote scp host mode.
+          - An empty value uses O(server_cert_scp_host).
+      server_cert_temp_user:
+        type: str
+        default: certdrop
+        description:
+          - Name of the temp account in the temp account mode.
+          - The account, a group with its name and its home must not exist.
+          - The role creates the account for each upload and deletes it with its home after the upload.

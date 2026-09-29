@@ -1,0 +1,399 @@
+---
+# All writes use the ssh CLI. A REST write to httpd_wrap_prof crashes profmgr on the conductor.
+# The change never reaches the members, and no error shows. The role uses REST for reads only.
+#
+# The conductor replays CLI audit entries to the members. Config IDs can match while the content
+# differs. The register and bind steps therefore check their effect on each node. Each of the two
+# has its own write memory.
+#
+# The device writes command output to stderr on a non-pty ssh session. Every ssh call merges
+# stderr into stdout.
+#
+# No plaintext secret goes on a command line. A task passes each secret on stdin, and the script
+# reads it with read. The script stops when a secret is empty. The script sends device input with
+# printf, a bash builtin. The user module puts the SHA-512 hash of the temp account password on
+# the useradd command line. At -vvv, ansible-core prints the stdin option, so every task with a
+# secret on stdin has no_log. A separate task shows the output of a failed read, register, bind or
+# delete. That output holds no secret. On ansible-core 2.19, a registered result also holds the
+# stdin option, and a task that loops over the results prints each result. The stop tasks
+# therefore build one message and never loop over the results.
+
+# These values go into shell commands and device CLI lines, so they must be plain.
+- name: Validate | hosts, user, files, name prefix and paths
+  ansible.builtin.assert:
+    that:
+      - server_cert_conductor is match('^[A-Za-z0-9][A-Za-z0-9.:-]*\Z')
+      - server_cert_scp_host is match('^[A-Za-z0-9][A-Za-z0-9.:-]*\Z')
+      - server_cert_username is match('^[A-Za-z0-9._-]+\Z')
+      - server_cert_fullchain is abs
+      - server_cert_privkey is abs
+      - server_cert_name_prefix is match('^[A-Za-z0-9]+\Z')
+      - server_cert_paths | length > 0
+      - server_cert_paths | map(attribute='path') | unique | list | length == server_cert_paths | length
+      - server_cert_paths | map(attribute='suffix') | map('lower') | unique | list | length == server_cert_paths | length
+    fail_msg: >-
+      server_cert_conductor and server_cert_scp_host must be a host name or an address.
+      server_cert_username must use only letters, digits, dot, underscore and dash.
+      server_cert_fullchain and server_cert_privkey must be absolute paths.
+      server_cert_name_prefix must be letters and digits only.
+      server_cert_paths must not be empty.
+      Each path and each suffix must be unique. Suffixes compare without case.
+    quiet: true
+
+- name: Validate | each item of server_cert_paths
+  ansible.builtin.assert:
+    that:
+      - item.path is match('^/[A-Za-z0-9_/.-]+\Z')
+      - item.suffix is match('^[A-Za-z0-9]+\Z')
+      - item.bind_fields | length > 0
+    fail_msg: >-
+      {{ item.path }}: the path must start with / and use only letters, digits, _ / . and -.
+      The suffix must be letters and digits only. bind_fields must not be empty.
+    quiet: true
+  loop: "{{ server_cert_paths }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Validate | remote scp host mode settings
+  ansible.builtin.assert:
+    that:
+      - server_cert_scp_user is match('^[A-Za-z0-9._-]+\Z')
+      - server_cert_scp_password | length > 0
+      - server_cert_scp_dir is match('^/[A-Za-z0-9_/.-]+\Z')
+      - (server_cert_scp_delegate or server_cert_scp_host) is match('^[A-Za-z0-9][A-Za-z0-9._:-]*\Z')
+    fail_msg: >-
+      The remote scp host mode needs a plain server_cert_scp_user and a server_cert_scp_password.
+      server_cert_scp_dir must be an absolute path.
+      server_cert_scp_delegate must be an inventory host name or an address.
+    quiet: true
+  when: server_cert_scp_user | length > 0
+
+- name: Validate | temp account name
+  ansible.builtin.assert:
+    that:
+      - server_cert_temp_user is match('^[a-z_][a-z0-9_-]*\Z')
+    fail_msg: server_cert_temp_user must be a plain lower-case account name.
+    quiet: true
+  when: server_cert_scp_user | length == 0
+
+- name: Facts | run mode and shared command parts
+  ansible.builtin.set_fact:
+    __server_cert_armed: "{{ server_cert_apply | bool and not ansible_check_mode }}"
+    __server_cert_temp_mode: "{{ server_cert_scp_user | length == 0 }}"
+    __server_cert_ssh: >-
+      sshpass -e ssh -l {{ server_cert_username | quote }}
+      {{ ('-o UserKnownHostsFile=' ~ (server_cert_ssh_known_hosts | quote) ~ ' -o StrictHostKeyChecking=yes')
+      if server_cert_ssh_known_hosts | length > 0 else '-o StrictHostKeyChecking=accept-new' }}
+    __server_cert_cli_error: "(?i)invalid input|incomplete command|unknown command|% ?error|denied|not found|failed"
+    __server_cert_base_url: "https://{{ server_cert_conductor }}:{{ server_cert_port }}"
+    __server_cert_read_sshpass: >-
+      IFS= read -r SSHPASS; [ -n "$SSHPASS" ] || { echo "The management password on stdin is empty."; exit 1; }; export SSHPASS
+
+# A secret with a trailing CR or LF would shift the next line that a script reads from stdin.
+- name: Facts | management password without a trailing CR or LF
+  ansible.builtin.set_fact:
+    __server_cert_pass: "{{ server_cert_password | regex_replace('[\\r\\n]+$', '') }}"
+  no_log: true
+
+- name: Report | read notAfter, serial and fingerprint of the certificate
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - x509
+      - -noout
+      - -enddate
+      - -serial
+      - -fingerprint
+      - -sha256
+      - -in
+      - "{{ server_cert_fullchain }}"
+  register: __server_cert_x509
+  changed_when: false
+  check_mode: false
+
+# The name carries the notAfter date in UTC. Two certificates with the same notAfter date get the
+# same name. The report flags the second one, and an apply run stops before any change. To push
+# it, change the suffix.
+- name: Report | certificate fingerprint, serial and date tag
+  ansible.builtin.set_fact:
+    __server_cert_store_fp: "{{ __server_cert_x509.stdout | regex_search('Fingerprint=(\\S+)', '\\1') | first }}"
+    __server_cert_store_serial: >-
+      {{ __server_cert_x509.stdout | regex_search('serial=(\S+)', '\1') | first
+         | replace(':', '') | lower | regex_replace('^0+', '') }}
+    __server_cert_datetag: >-
+      {{ (__server_cert_x509.stdout | regex_search('notAfter=(.+)', '\1') | first | trim
+          | to_datetime('%b %d %H:%M:%S %Y %Z')).strftime('%Y%m%d') }}
+
+# The /mm master is the show switches row of type conductor. Older AOS 8 releases call it master.
+# That name is untested. A /md path takes its members from show configuration node-hierarchy.
+# The role checks every node before a delete, so a node that the role cannot see stops the run.
+- name: Report | discover the cluster topology
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ __server_cert_read_sshpass }}
+    SW=$(timeout 20 {{ __server_cert_ssh }} {{ server_cert_conductor | quote }} "show switches" 2>&1) || \
+      { echo "show switches failed on the conductor: $SW"; exit 1; }
+    NH=$(timeout 20 {{ __server_cert_ssh }} {{ server_cert_conductor | quote }} "show configuration node-hierarchy" 2>&1) || \
+      { echo "show configuration node-hierarchy failed on the conductor: $NH"; exit 1; }
+    export SW NH
+    python3 - {{ server_cert_paths | map(attribute='path') | map('quote') | join(' ') }} <<'PYEOF'
+    import json, os, re, sys
+
+
+    def stop(msg):
+        print(msg)
+        sys.exit(1)
+
+
+    sw = os.environ['SW']
+    nh = os.environ['NH']
+    paths = sys.argv[1:]
+
+    sw_rows = {}
+    for line in sw.splitlines():
+        parts = line.split()
+        if len(parts) < 9 or not re.match(r'^\d+\.\d+\.\d+\.\d+$', parts[0]):
+            continue
+        if not re.match(r'^[A-Za-z0-9._-]+$', parts[2]):
+            stop('show switches has a node name with unsafe characters: ' + repr(parts[2]))
+        sw_rows[parts[2]] = {'ip': parts[0], 'type': parts[4]}
+    if not sw_rows:
+        stop('show switches returned no node rows:\n' + sw)
+
+    nh_devices = []
+    for line in nh.splitlines():
+        m = re.match(r'^(\S+)\s+Device\s+(\S+)', line)
+        if m:
+            nh_devices.append((m.group(1), m.group(2)))
+
+    result = {}
+    for path in paths:
+        master = None
+        members = []
+        if path == '/mm':
+            for name, d in sw_rows.items():
+                if d['type'] in ('conductor', 'master'):
+                    master = {'name': name, 'ip': d['ip']}
+                elif d['type'] == 'standby':
+                    members.append({'name': name, 'ip': d['ip']})
+            if master is None:
+                stop('/mm: show switches has no row of type conductor or master.')
+        else:
+            for config_node, name in nh_devices:
+                if not config_node.startswith(path + '/'):
+                    continue
+                if name not in sw_rows:
+                    stop(path + ': the node hierarchy lists ' + repr(name) + ', and show switches does not.')
+                members.append({'name': name, 'ip': sw_rows[name]['ip']})
+            if not members:
+                stop(path + ': the node hierarchy has no device under this path.')
+        result[path] = {'master': master, 'members': members}
+
+    print(json.dumps(result))
+    PYEOF
+  args:
+    executable: /bin/bash
+    stdin: "{{ __server_cert_pass }}"
+  register: __server_cert_topology_raw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  no_log: true
+
+- name: Report | stop when the topology read failed
+  ansible.builtin.fail:
+    msg: "{{ __server_cert_topology_raw.stdout }}"
+  when: __server_cert_topology_raw.rc != 0
+
+- name: Report | topology fact
+  ansible.builtin.set_fact:
+    __server_cert_topology: "{{ __server_cert_topology_raw.stdout | from_json }}"
+
+# This read is for the report only. A node serves a new certificate only after httpd restarts, so
+# the served certificate can lag the config. The push decision reads the config.
+- name: Report | served fingerprint on the conductor
+  ansible.builtin.shell: |
+    set -o pipefail
+    timeout 10 openssl s_client -connect {{ (server_cert_conductor ~ ':' ~ server_cert_port) | quote }} \
+      -servername {{ server_cert_conductor | quote }} </dev/null 2>/dev/null | openssl x509 -fingerprint -sha256 -noout
+  args:
+    executable: /bin/bash
+  register: __server_cert_conductor_served
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Report | read the current binds
+  ansible.builtin.include_tasks: read_binds.yml
+  vars:
+    __server_cert_read_paths: "{{ server_cert_paths | map(attribute='path') | list }}"
+
+# The list has one entry per path. The rest of the role works from this list.
+- name: Report | init the per-path state
+  ansible.builtin.set_fact:
+    __server_cert_state: []
+
+- name: Report | per-path state and push decision
+  ansible.builtin.set_fact:
+    __server_cert_state: "{{ __server_cert_state + [__server_cert_entry] }}"
+  vars:
+    __server_cert_name: "{{ server_cert_name_prefix }}_{{ __server_cert_datetag }}_{{ item.suffix }}"
+    __server_cert_current: "{{ __server_cert_binds[item.path] }}"
+    __server_cert_master: "{{ __server_cert_topology[item.path].master }}"
+    __server_cert_entry:
+      path: "{{ item.path }}"
+      bind_fields: "{{ item.bind_fields }}"
+      master: "{{ __server_cert_master }}"
+      members: "{{ __server_cert_topology[item.path].members }}"
+      nodes: "{{ ([__server_cert_master] if __server_cert_master else []) + __server_cert_topology[item.path].members }}"
+      name: "{{ __server_cert_name }}"
+      flash: "{{ __server_cert_name | lower }}.p12"
+      current: "{{ __server_cert_current }}"
+      push: "{{ item.bind_fields | map('extract', __server_cert_current) | select('ne', __server_cert_name) | list | length > 0 }}"
+  loop: "{{ server_cert_paths }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Report | push decision
+  ansible.builtin.set_fact:
+    __server_cert_any_push: "{{ __server_cert_state | selectattr('push') | list | length > 0 }}"
+
+# The conductor shows the material of /mm. Only a member shows the material of an /md path. The
+# first node of a path is the master for /mm and a member for /md, so the role reads it there. An
+# empty read means that no certificate holds the name yet.
+- name: Report | read the certificate that holds each name
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ __server_cert_read_sshpass }}
+    timeout 20 {{ __server_cert_ssh }} {{ item.nodes[0].ip | quote }} \
+      {{ ('show crypto-local pki serverCert ' ~ item.name) | quote }} 2>&1
+  args:
+    executable: /bin/bash
+    stdin: "{{ __server_cert_pass }}"
+  register: __server_cert_held
+  loop: "{{ __server_cert_state }}"
+  loop_control:
+    label: "{{ item.path }}"
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  no_log: true
+
+- name: Report | stop when a certificate read failed
+  ansible.builtin.fail:
+    msg: >-
+      {% for r in __server_cert_held.results | rejectattr('rc', 'eq', 0) %}{{ r.item.nodes[0].name }}:
+      show crypto-local pki serverCert {{ r.item.name }} failed: {{ r.stdout }} {% endfor %}
+  when: __server_cert_held.results | rejectattr('rc', 'eq', 0) | list | length > 0
+
+# The device prints a long serial number on the next line as hex with colons. It prints a short one
+# as "<decimal> (0x<hex>)". The compare ignores case, colons and leading zeros.
+- name: Report | paths where a different certificate holds the name
+  ansible.builtin.set_fact:
+    __server_cert_collisions: >-
+      {{ __server_cert_held.results | map(attribute='item.path')
+         | zip(__server_cert_held.results | map(attribute='stdout')
+               | map('regex_search', 'Serial Number:\s*(?:\S+ \(0x)?([0-9A-Fa-f:]+)', '\1') | map('default', [''], true) | map('first')
+               | map('replace', ':', '') | map('lower') | map('regex_replace', '^0+', ''))
+         | rejectattr('1', 'eq', '') | rejectattr('1', 'eq', __server_cert_store_serial) | map(attribute='0') | list }}
+
+- name: Report | state per path
+  ansible.builtin.debug:
+    msg: |
+      {{ item.path }} {{ item.bind_fields | join(' + ') }}: bound {{ item.bind_fields | map('extract', item.current) | list }},
+        master {{ item.master.name if item.master else 'n/a' }}, members {{ item.members | map(attribute='name') | list }},
+        served on the conductor (report only) {{ (__server_cert_conductor_served.stdout | regex_replace('^.*Fingerprint=', '') | trim) or 'UNREACHABLE' }},
+        {{ (('name current' if not item.push else item.name ~ ' exists') ~ ', but a different certificate holds it; change the suffix to push this one')
+           if item.path in __server_cert_collisions else ('would push ' ~ item.name if item.push else 'current') }}
+  loop: "{{ __server_cert_state }}"
+  loop_control:
+    label: "{{ item.path }}"
+  when: not __server_cert_armed
+
+- name: Preflight | stop when a different certificate holds a name
+  ansible.builtin.fail:
+    msg: >-
+      {% for entry in __server_cert_state | selectattr('path', 'in', __server_cert_collisions) %}{{ entry.path }}:
+      a different certificate holds {{ entry.name }}. {% endfor %}To push this certificate, change the suffix.
+      The role stopped before any change.
+  when: __server_cert_armed and __server_cert_collisions | length > 0
+
+# A cluster that has not converged, or that reports a config failure, stops the run before any write.
+- name: Preflight | converge gate on every discovered node
+  ansible.builtin.include_tasks: converge_gate.yml
+  vars:
+    __server_cert_gate_ips: "{{ __server_cert_state | map(attribute='nodes') | flatten(1) | map(attribute='ip') | unique | list }}"
+  when: __server_cert_armed
+
+- name: Push | stale paths
+  when: __server_cert_armed and __server_cert_any_push
+  block:
+    # The import accepts only an alphanumeric passphrase of at most 23 characters.
+    - name: Push | p12 passphrase and temp account password
+      ansible.builtin.set_fact:
+        __server_cert_p12_pass: "{{ lookup('ansible.builtin.password', '/dev/null chars=ascii_letters,digits length=20') }}"
+        __server_cert_temp_pass: "{{ lookup('ansible.builtin.password', '/dev/null chars=ascii_letters,digits length=20') }}"
+      no_log: true
+
+    - name: Push | hash the temp account password
+      ansible.builtin.command:
+        cmd: openssl passwd -6 -stdin
+        stdin: "{{ __server_cert_temp_pass }}"
+      register: __server_cert_temp_hash
+      changed_when: false
+      no_log: true
+      when: __server_cert_temp_mode
+
+    # In the temp account mode, root owns this directory, and the temp account cannot read it.
+    - name: Push | local staging directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: .server_cert
+      become: "{{ __server_cert_temp_mode }}"
+      register: __server_cert_tmpdir
+
+    - name: Push | scp login
+      ansible.builtin.set_fact:
+        __server_cert_pull_dir: "{{ '' if __server_cert_temp_mode else (server_cert_scp_dir | regex_replace('/+$', '')) ~ '/' }}"
+        __server_cert_pull_user: "{{ server_cert_temp_user if __server_cert_temp_mode else server_cert_scp_user }}"
+        __server_cert_pull_pass: "{{ (__server_cert_temp_pass if __server_cert_temp_mode else server_cert_scp_password) | regex_replace('[\\r\\n]+$', '') }}"
+      no_log: true
+
+    - name: Push | each stale path, one at a time
+      ansible.builtin.include_tasks: push_path.yml
+      loop: "{{ __server_cert_state | selectattr('push') | list }}"
+      loop_control:
+        loop_var: __server_cert_path
+        label: "{{ __server_cert_path.path }}"
+
+  always:
+    - name: Push | remove the local staging directory
+      ansible.builtin.file:
+        path: "{{ __server_cert_tmpdir.path }}"
+        state: absent
+      become: "{{ __server_cert_temp_mode }}"
+      when: __server_cert_tmpdir.path is defined
+
+# A delete must never remove a certificate that a node still serves. This pass runs on every
+# armed run. The store certificate is the certificate in server_cert_fullchain. The role does not
+# restart a node that serves the store certificate. Only switch-cert sets what a node serves on
+# server_cert_port, so the pass skips a path without switch-cert.
+- name: Served | each node of each path with switch-cert, one node at a time
+  ansible.builtin.include_tasks: restart_node.yml
+  loop: "{{ __server_cert_state | selectattr('bind_fields', 'contains', 'switch-cert') | subelements('nodes') }}"
+  loop_control:
+    loop_var: __server_cert_path_node
+    label: "{{ __server_cert_path_node.1.name }}"
+  vars:
+    __server_cert_node: "{{ __server_cert_path_node.1 }}"
+    __server_cert_restart_name: "{{ __server_cert_path_node.0.name }}"
+  when: __server_cert_armed
+
+# Cleanup also runs when no path needed a push. An earlier run can leave unbound names.
+- name: Cleanup | each configured path, one at a time
+  ansible.builtin.include_tasks: cleanup_path.yml
+  loop: "{{ __server_cert_state }}"
+  loop_control:
+    loop_var: __server_cert_path
+    label: "{{ __server_cert_path.path }}"
+  when: __server_cert_armed and server_cert_cleanup | bool

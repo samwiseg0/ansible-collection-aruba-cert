@@ -1,0 +1,53 @@
+---
+# The gate passes when every show switches row is UPDATE SUCCESSFUL at one config ID. Each address
+# in __server_cert_gate_ips must also answer ssh and show an empty show configuration failure. A
+# matching config ID does not prove that the content arrived, so the caller also checks each node.
+#
+# A failed audit replays only when a new audit arrives. To recover a node that stays failed, make a
+# fresh valid change on the conductor.
+- name: Gate | wait until the cluster converges
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ __server_cert_read_sshpass }}
+    FAIL=0
+    SW=$(timeout 20 {{ __server_cert_ssh }} {{ server_cert_conductor | quote }} "show switches" 2>&1) || \
+      { echo "CONVERGE FAIL: ssh to the conductor exited $?"; FAIL=1; }
+    echo "$SW"
+    ROWS=$(echo "$SW" | grep -cE '^[0-9]+\.')
+    if [ "$ROWS" -lt 1 ]; then echo "CONVERGE FAIL: show switches returned no node rows"; FAIL=1; fi
+    BAD=$(echo "$SW" | awk '/^[0-9]+\./ && !/UPDATE SUCCESSFUL/')
+    if [ -n "$BAD" ]; then
+      echo "CONVERGE FAIL: a node is not UPDATE SUCCESSFUL:"
+      echo "$BAD"
+      FAIL=1
+    fi
+    IDS=$(echo "$SW" | awk '/^[0-9]+\./ {print $(NF-1)}' | sort -u)
+    if [ "$(echo "$IDS" | grep -c .)" != "1" ]; then
+      echo "CONVERGE FAIL: config IDs differ across nodes: $(echo $IDS | tr '\n' ' ')"
+      FAIL=1
+    fi
+    {% for ip in __server_cert_gate_ips %}
+    CF=$(timeout 20 {{ __server_cert_ssh }} {{ ip | quote }} "show configuration failure" 2>&1) || \
+      { echo "HEALTH FAIL on" {{ ip | quote }}": ssh exited $?"; FAIL=1; }
+    if [ -n "$(echo "$CF" | tr -d '[:space:]')" ]; then
+      echo "HEALTH FAIL on" {{ ip | quote }}", show configuration failure:"
+      echo "$CF"
+      FAIL=1
+    fi
+    {% endfor %}
+    exit $FAIL
+  args:
+    executable: /bin/bash
+    stdin: "{{ __server_cert_pass }}"
+  register: __server_cert_gate
+  until: __server_cert_gate.rc == 0
+  retries: 36  # measured ~3s after a register or at preflight, ~30s after a bind, ceiling 180s
+  delay: 5
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Gate | stop when the cluster did not converge
+  ansible.builtin.fail:
+    msg: "{{ __server_cert_gate.stdout_lines }}"
+  when: __server_cert_gate.rc != 0

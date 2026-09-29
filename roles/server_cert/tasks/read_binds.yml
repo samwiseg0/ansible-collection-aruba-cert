@@ -1,0 +1,72 @@
+---
+# This file reads the web server profile over REST. The caller sets __server_cert_read_paths. The
+# result is __server_cert_binds, keyed by path, with the name on each bind field. An unset field
+# reads as ''.
+- name: REST | read the binds
+  block:
+    - name: REST | log in
+      ansible.builtin.uri:
+        url: "{{ __server_cert_base_url }}/v1/api/login"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          username: "{{ server_cert_username }}"
+          password: "{{ __server_cert_pass }}"
+        validate_certs: "{{ server_cert_validate_certs }}"
+        ca_path: "{{ server_cert_ca_path | default(omit, true) }}"
+        return_content: true
+      register: __server_cert_login
+      changed_when: false
+      check_mode: false
+      no_log: true
+      failed_when: (__server_cert_login.json._global_result.status | default('')) != '0'
+
+    - name: REST | web server profile per path
+      ansible.builtin.uri:
+        url: >-
+          {{ __server_cert_base_url }}/v1/configuration/object/httpd_wrap_prof?config_path={{ item | urlencode }}&UIDARUBA={{
+          __server_cert_login.json._global_result.UIDARUBA }}&json=1
+        method: GET
+        headers:
+          Cookie: "{{ __server_cert_login.cookies_string }}"
+        validate_certs: "{{ server_cert_validate_certs }}"
+        ca_path: "{{ server_cert_ca_path | default(omit, true) }}"
+        return_content: true
+      register: __server_cert_bind_get
+      loop: "{{ __server_cert_read_paths }}"
+      changed_when: false
+      check_mode: false
+      no_log: true
+      failed_when: __server_cert_bind_get.json._data.httpd_wrap_prof is not defined
+
+    - name: REST | init the bind map
+      ansible.builtin.set_fact:
+        __server_cert_binds: {}
+
+    # A path can lack the cp_cert object, so each field read has a default.
+    - name: REST | bind names per path
+      ansible.builtin.set_fact:
+        __server_cert_binds: >-
+          {{ __server_cert_binds | combine({item.0: {
+               'switch-cert': (item.1.switch_cert | default({}))['switch-cert'] | default(''),
+               'captive-portal-cert': (item.1.cp_cert | default({}))['captive-portal-cert'] | default('')}}) }}
+      loop: >-
+        {{ __server_cert_read_paths | zip(__server_cert_bind_get.results | map(attribute='json')
+           | map(attribute='_data') | map(attribute='httpd_wrap_prof')) | list }}
+      loop_control:
+        label: "{{ item.0 }}"
+
+  always:
+    - name: REST | log out
+      ansible.builtin.uri:
+        url: "{{ __server_cert_base_url }}/v1/api/logout?UIDARUBA={{ __server_cert_login.json._global_result.UIDARUBA }}"
+        method: POST
+        headers:
+          Cookie: "{{ __server_cert_login.cookies_string }}"
+        validate_certs: "{{ server_cert_validate_certs }}"
+        ca_path: "{{ server_cert_ca_path | default(omit, true) }}"
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      no_log: true
+      when: __server_cert_login.json._global_result.UIDARUBA is defined

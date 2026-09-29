@@ -1,0 +1,4 @@
+.ansible/
+*.tar.gz
+tests/output/
+__pycache__/

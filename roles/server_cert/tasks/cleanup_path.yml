@@ -1,0 +1,49 @@
+---
+# This file runs once per configured path. It reads the binds fresh, because a push earlier in
+# this run can change them.
+- name: Cleanup | read the current binds at {{ __server_cert_path.path }}
+  ansible.builtin.include_tasks: read_binds.yml
+  vars:
+    __server_cert_read_paths: ["{{ __server_cert_path.path }}"]
+
+- name: Cleanup | list the certificates at {{ __server_cert_path.path }}
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ __server_cert_read_sshpass }}
+    timeout 20 {{ __server_cert_ssh }} {{ server_cert_conductor | quote }} \
+      {{ ('show certificates ' ~ __server_cert_path.path) | quote }} 2>&1
+  args:
+    executable: /bin/bash
+    stdin: "{{ __server_cert_pass }}"
+  register: __server_cert_certs
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Cleanup | stop when the certificate list failed at {{ __server_cert_path.path }}
+  ansible.builtin.fail:
+    msg: "show certificates {{ __server_cert_path.path }} failed: {{ __server_cert_certs.stdout }}"
+  when: __server_cert_certs.rc != 0
+
+# The pattern matches only names in the format this role creates. The role keeps a name that
+# either web server profile field binds. It also keeps a name dated on or after the current date tag.
+- name: Cleanup | unbound names of this role at {{ __server_cert_path.path }}
+  ansible.builtin.set_fact:
+    __server_cert_stale: >-
+      {{ __server_cert_certs.stdout
+         | regex_findall('^(' ~ (server_cert_name_prefix | regex_escape) ~ '_(\d{8})_[A-Za-z0-9]+)\s+ServerCert', multiline=True)
+         | selectattr('1', 'lt', __server_cert_datetag)
+         | map(attribute='0')
+         | reject('in', __server_cert_binds[__server_cert_path.path].values() | list)
+         | unique | list }}
+
+- name: Cleanup | nothing to delete at {{ __server_cert_path.path }}
+  ansible.builtin.debug:
+    msg: "{{ __server_cert_path.path }}: no unbound names."
+  when: __server_cert_stale | length == 0
+
+- name: Cleanup | each unbound name, one at a time, at {{ __server_cert_path.path }}
+  ansible.builtin.include_tasks: cleanup_name.yml
+  loop: "{{ __server_cert_stale }}"
+  loop_control:
+    loop_var: __server_cert_stale_name

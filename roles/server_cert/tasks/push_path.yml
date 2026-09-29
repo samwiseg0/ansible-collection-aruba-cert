@@ -1,0 +1,386 @@
+---
+# This file runs once per stale path, one path at a time. Each device step gets its own ssh
+# session. The register and bind steps each have their own write memory. The role verifies each
+# step before the next one.
+- name: Push | build the p12 for {{ __server_cert_path.path }}
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - pkcs12
+      - -export
+      - -certpbe
+      - AES-256-CBC
+      - -keypbe
+      - AES-256-CBC
+      - -macalg
+      - SHA256
+      - -inkey
+      - "{{ server_cert_privkey }}"
+      - -in
+      - "{{ server_cert_fullchain }}"
+      - -passout
+      - stdin
+      - -out
+      - "{{ __server_cert_tmpdir.path }}/{{ __server_cert_path.flash }}"
+    stdin: "{{ __server_cert_p12_pass }}"
+  become: "{{ __server_cert_temp_mode }}"
+  changed_when: true
+  no_log: true
+
+# The upload deletes the temp account, its home and its group at the end. It must never delete an
+# account, a home or a group that existed before the upload.
+- name: Push | read the temp account for {{ __server_cert_path.path }}
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ server_cert_temp_user }}"
+    fail_key: false
+  when: __server_cert_temp_mode
+
+- name: Push | read the group of the temp account for {{ __server_cert_path.path }}
+  ansible.builtin.getent:
+    database: group
+    key: "{{ server_cert_temp_user }}"
+    fail_key: false
+  when: __server_cert_temp_mode
+
+- name: Push | read the temp account home for {{ __server_cert_path.path }}
+  ansible.builtin.stat:
+    path: "/home/{{ server_cert_temp_user }}"
+    follow: false
+  register: __server_cert_temp_home
+  when: __server_cert_temp_mode
+
+- name: Push | refuse an existing temp account, group or home for {{ __server_cert_path.path }}
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.getent_passwd[server_cert_temp_user] is none
+      - ansible_facts.getent_group[server_cert_temp_user] is none
+      - not __server_cert_temp_home.stat.exists
+    fail_msg: >-
+      The account {{ server_cert_temp_user }}, the group {{ server_cert_temp_user }} or the path
+      /home/{{ server_cert_temp_user }} already exists.
+      The upload deletes this account, its group and its home at the end.
+      Set server_cert_temp_user to an unused name.
+      If an earlier run of this role left the account, delete it by hand.
+    quiet: true
+  when: __server_cert_temp_mode
+
+# The temp account and the p12 on the scp host exist only for this upload.
+- name: Push | upload the p12 for {{ __server_cert_path.path }}
+  block:
+    - name: Push | create the temp account for {{ __server_cert_path.path }}
+      ansible.builtin.user:
+        name: "{{ server_cert_temp_user }}"
+        password: "{{ __server_cert_temp_hash.stdout }}"
+        home: "/home/{{ server_cert_temp_user }}"
+        shell: /bin/bash
+        create_home: true
+        system: true
+        update_password: on_create
+      become: true
+      no_log: true
+      when: __server_cert_temp_mode
+
+    # The temp account can read its home and the p12. It cannot write to either.
+    - name: Push | temp account home is root-owned with mode 0750 for {{ __server_cert_path.path }}
+      ansible.builtin.file:
+        path: "/home/{{ server_cert_temp_user }}"
+        state: directory
+        owner: root
+        group: "{{ server_cert_temp_user }}"
+        mode: "0750"
+        follow: false
+      become: true
+      when: __server_cert_temp_mode
+
+    - name: Push | install the p12 in the temp account home for {{ __server_cert_path.path }}
+      ansible.builtin.copy:
+        src: "{{ __server_cert_tmpdir.path }}/{{ __server_cert_path.flash }}"
+        dest: "/home/{{ server_cert_temp_user }}/{{ __server_cert_path.flash }}"
+        remote_src: true
+        owner: root
+        group: "{{ server_cert_temp_user }}"
+        mode: "0640"
+        follow: false
+      become: true
+      when: __server_cert_temp_mode
+
+    # A play-level connection: local also applies to delegated tasks. The connection keyword
+    # restores the default. An ansible_connection set for the delegate in inventory still wins.
+    - name: Push | copy the p12 to the scp host for {{ __server_cert_path.path }}
+      ansible.builtin.copy:
+        src: "{{ __server_cert_tmpdir.path }}/{{ __server_cert_path.flash }}"
+        dest: "{{ __server_cert_pull_dir }}{{ __server_cert_path.flash }}"
+        owner: "{{ server_cert_scp_user }}"
+        mode: "0600"
+      delegate_to: "{{ server_cert_scp_delegate or server_cert_scp_host }}"
+      connection: ssh
+      ignore_unreachable: true
+      register: __server_cert_scp_copy
+      when: not __server_cert_temp_mode
+
+    - name: Push | stop when the scp host is unreachable for {{ __server_cert_path.path }}
+      ansible.builtin.fail:
+        msg: "{{ server_cert_scp_delegate or server_cert_scp_host }} is unreachable. The p12 did not reach the scp host."
+      when: not __server_cert_temp_mode and __server_cert_scp_copy.unreachable | default(false)
+
+    # copy scp: prints progress output. The device discards the next input line after this
+    # output, so the upload gets its own session.
+    - name: Push | the conductor pulls the p12 over scp for {{ __server_cert_path.path }}
+      ansible.builtin.shell: |
+        set -o pipefail
+        {{ __server_cert_read_sshpass }}
+        IFS= read -r PULLPASS; [ -n "$PULLPASS" ] || { echo "The scp password on stdin is empty."; exit 1; }
+        printf '%s\n' {{ ('copy scp: ' ~ server_cert_scp_host ~ ' ' ~ __server_cert_pull_user ~ ' ' ~ __server_cert_pull_dir
+          ~ __server_cert_path.flash ~ ' flash: ' ~ __server_cert_path.flash) | quote }} "$PULLPASS" |
+          timeout 60 {{ __server_cert_ssh }} {{ server_cert_conductor | quote }} 2>&1
+      args:
+        executable: /bin/bash
+        stdin: |-
+          {{ __server_cert_pass }}
+          {{ __server_cert_pull_pass }}
+      register: __server_cert_scp
+      changed_when: true
+      no_log: true
+      failed_when: >-
+        __server_cert_scp.rc != 0 or
+        (__server_cert_scp.stdout | default('') | regex_search(__server_cert_cli_error)) is not none
+
+    - name: Push | read the flash directory for {{ __server_cert_path.path }}
+      ansible.builtin.shell: |
+        set -o pipefail
+        {{ __server_cert_read_sshpass }}
+        timeout 20 {{ __server_cert_ssh }} {{ server_cert_conductor | quote }} dir 2>&1
+      args:
+        executable: /bin/bash
+        stdin: "{{ __server_cert_pass }}"
+      register: __server_cert_dir
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Push | the p12 is on flash for {{ __server_cert_path.path }}
+      ansible.builtin.assert:
+        that:
+          - __server_cert_dir.rc == 0
+          - __server_cert_path.flash in __server_cert_dir.stdout
+        fail_msg: "{{ __server_cert_path.flash }} is not on the conductor flash after the upload. dir printed: {{ __server_cert_dir.stdout }}"
+        quiet: true
+
+  always:
+    # The scp session of the conductor can stay open for a moment after the transfer. pkill ends
+    # it. pkill exits non-zero when no process matches, so the task ignores the result.
+    - name: Push | end the processes of the temp account for {{ __server_cert_path.path }}
+      ansible.builtin.command:
+        argv:
+          - pkill
+          - -KILL
+          - -u
+          - "{{ server_cert_temp_user }}"
+      become: true
+      changed_when: false
+      failed_when: false
+      when: __server_cert_temp_mode
+
+    # userdel can still fail for a moment after pkill, so the task retries 5 times.
+    - name: Push | remove the temp account for {{ __server_cert_path.path }}
+      ansible.builtin.user:
+        name: "{{ server_cert_temp_user }}"
+        state: absent
+        remove: true
+        force: true
+      become: true
+      register: __server_cert_temp_removed
+      until: __server_cert_temp_removed is succeeded
+      retries: 5
+      delay: 3
+      no_log: true
+      when: __server_cert_temp_mode
+
+    - name: Push | remove the p12 from the scp host for {{ __server_cert_path.path }}
+      ansible.builtin.file:
+        path: "{{ __server_cert_pull_dir }}{{ __server_cert_path.flash }}"
+        state: absent
+      delegate_to: "{{ server_cert_scp_delegate or server_cert_scp_host }}"
+      connection: ssh
+      ignore_unreachable: true
+      register: __server_cert_scp_removed
+      when: not __server_cert_temp_mode and not (__server_cert_scp_copy.unreachable | default(false))
+
+    - name: Push | stop when the scp host was unreachable for the removal for {{ __server_cert_path.path }}
+      ansible.builtin.fail:
+        msg: >-
+          {{ server_cert_scp_delegate or server_cert_scp_host }} is unreachable.
+          Remove {{ __server_cert_pull_dir }}{{ __server_cert_path.flash }} from it by hand.
+      when: not __server_cert_temp_mode and __server_cert_scp_removed.unreachable | default(false)
+
+# The import applies to the path set by cd. The device discards the next input line after its
+# success message, so the import gets its own session. The import alone distributes nothing to
+# the members.
+- name: Push | import the p12 at {{ __server_cert_path.path }}
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ __server_cert_read_sshpass }}
+    IFS= read -r P12PASS; [ -n "$P12PASS" ] || { echo "The p12 passphrase on stdin is empty."; exit 1; }
+    printf '%s\n' 'configure terminal' {{ ('cd ' ~ __server_cert_path.path) | quote }} \
+      "crypto pki-import pkcs12 ServerCert {{ __server_cert_path.name }} {{ __server_cert_path.flash }} $P12PASS" |
+      timeout 60 {{ __server_cert_ssh }} {{ server_cert_conductor | quote }} 2>&1
+  args:
+    executable: /bin/bash
+    stdin: |-
+      {{ __server_cert_pass }}
+      {{ __server_cert_p12_pass }}
+  register: __server_cert_import
+  changed_when: true
+  no_log: true
+  failed_when: >-
+    __server_cert_import.rc != 0 or
+    (__server_cert_import.stdout | default('') | regex_search(__server_cert_cli_error)) is not none
+
+# show crypto-local pki serverCert does not reliably show a fresh import. A second import is the
+# proven check. "Similar name" or a fresh success message confirms the first import.
+- name: Push | a second import confirms the first at {{ __server_cert_path.path }}
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ __server_cert_read_sshpass }}
+    IFS= read -r P12PASS; [ -n "$P12PASS" ] || { echo "The p12 passphrase on stdin is empty."; exit 1; }
+    printf '%s\n' 'configure terminal' {{ ('cd ' ~ __server_cert_path.path) | quote }} \
+      "crypto pki-import pkcs12 ServerCert {{ __server_cert_path.name }} {{ __server_cert_path.flash }} $P12PASS" |
+      timeout 60 {{ __server_cert_ssh }} {{ server_cert_conductor | quote }} 2>&1
+  args:
+    executable: /bin/bash
+    stdin: |-
+      {{ __server_cert_pass }}
+      {{ __server_cert_p12_pass }}
+  register: __server_cert_import_probe
+  changed_when: true
+  no_log: true
+  until: >-
+    __server_cert_import_probe.rc == 0 and
+    (__server_cert_import_probe.stdout | default('') | regex_search(__server_cert_cli_error)) is none and
+    (__server_cert_import_probe.stdout | default('') | regex_search('(?i)similar name|certificate is uploaded')) is not none
+  retries: 12  # passes on the first attempt in practice, ceiling 60s
+  delay: 5
+  failed_when: >-
+    __server_cert_import_probe.rc != 0 or
+    (__server_cert_import_probe.stdout | default('') | regex_search(__server_cert_cli_error)) is not none or
+    (__server_cert_import_probe.stdout | default('') | regex_search('(?i)similar name|certificate is uploaded')) is none
+
+# The register step is a config change, so its audit replay carries the material to the members.
+# A bind in the same audit as its register can arrive before the material and fail. The bind gets
+# its own write memory.
+- name: Push | register the certificate at {{ __server_cert_path.path }}
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ __server_cert_read_sshpass }}
+    printf '%s\n' 'configure terminal' {{ ('cd ' ~ __server_cert_path.path) | quote }} \
+      {{ ('crypto-local pki serverCert ' ~ __server_cert_path.name ~ ' ' ~ __server_cert_path.flash) | quote }} 'write memory' |
+      timeout 60 {{ __server_cert_ssh }} {{ server_cert_conductor | quote }} 2>&1
+  args:
+    executable: /bin/bash
+    stdin: "{{ __server_cert_pass }}"
+  register: __server_cert_register
+  changed_when: true
+  failed_when: false
+  no_log: true
+
+- name: Push | stop when the register step failed at {{ __server_cert_path.path }}
+  ansible.builtin.fail:
+    msg: "The register step failed at {{ __server_cert_path.path }}. The device printed: {{ __server_cert_register.stdout }}"
+  when: >-
+    __server_cert_register.rc != 0 or
+    (__server_cert_register.stdout | default('') | regex_search(__server_cert_cli_error)) is not none
+
+- name: Push | converge gate after the register step at {{ __server_cert_path.path }}
+  ansible.builtin.include_tasks: converge_gate.yml
+  vars:
+    __server_cert_gate_ips: "{{ __server_cert_path.nodes | map(attribute='ip') | list }}"
+
+- name: Push | read the certificate material on each member for {{ __server_cert_path.path }}
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ __server_cert_read_sshpass }}
+    timeout 20 {{ __server_cert_ssh }} {{ item.ip | quote }} \
+      {{ ('show crypto-local pki serverCert ' ~ __server_cert_path.name) | quote }} 2>&1
+  args:
+    executable: /bin/bash
+    stdin: "{{ __server_cert_pass }}"
+  register: __server_cert_material
+  loop: "{{ __server_cert_path.members }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: false
+  failed_when: false
+  no_log: true
+  retries: 30  # measured ~1s, ceiling 300s
+  delay: 10
+  until: "'Version:' in (__server_cert_material.stdout | default(''))"
+
+- name: Push | stop before the bind when a member lacks the material for {{ __server_cert_path.path }}
+  ansible.builtin.fail:
+    msg: >-
+      {{ __server_cert_material.results | rejectattr('stdout', 'search', 'Version:') | map(attribute='item.name') | join(', ') }}
+      has no ServerCert {{ __server_cert_path.name }} after the register step. The role stopped before the bind.
+  when: __server_cert_material.results | rejectattr('stdout', 'search', 'Version:') | list | length > 0
+
+- name: Push | bind the certificate at {{ __server_cert_path.path }}
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ __server_cert_read_sshpass }}
+    printf '%s\n' 'configure terminal' {{ ('cd ' ~ __server_cert_path.path) | quote }} 'web-server profile' \
+      {% for field in __server_cert_path.bind_fields %}{{ (field ~ ' ' ~ __server_cert_path.name) | quote }} {% endfor %}'exit' 'write memory' |
+      timeout 60 {{ __server_cert_ssh }} {{ server_cert_conductor | quote }} 2>&1
+  args:
+    executable: /bin/bash
+    stdin: "{{ __server_cert_pass }}"
+  register: __server_cert_bind
+  changed_when: true
+  failed_when: false
+  no_log: true
+
+- name: Push | stop when the bind step failed at {{ __server_cert_path.path }}
+  ansible.builtin.fail:
+    msg: "The bind step failed at {{ __server_cert_path.path }}. The device printed: {{ __server_cert_bind.stdout }}"
+  when: >-
+    __server_cert_bind.rc != 0 or
+    (__server_cert_bind.stdout | default('') | regex_search(__server_cert_cli_error)) is not none
+
+- name: Push | read the binds back over REST at {{ __server_cert_path.path }}
+  ansible.builtin.include_tasks: read_binds.yml
+  vars:
+    __server_cert_read_paths: ["{{ __server_cert_path.path }}"]
+
+# The captive portal is on the guest network, so the role verifies captive-portal-cert by config only.
+- name: Push | every bind field shows the new name at {{ __server_cert_path.path }}
+  ansible.builtin.assert:
+    that:
+      - >-
+        __server_cert_path.bind_fields | map('extract', __server_cert_binds[__server_cert_path.path])
+        | select('ne', __server_cert_path.name) | list | length == 0
+    fail_msg: "{{ __server_cert_path.path }} did not show {{ __server_cert_path.name }} on every bind field after the bind."
+    quiet: true
+
+- name: Push | converge gate after the bind at {{ __server_cert_path.path }}
+  ansible.builtin.include_tasks: converge_gate.yml
+  vars:
+    __server_cert_gate_ips: "{{ __server_cert_path.nodes | map(attribute='ip') | list }}"
+
+# The converge gate shows that no node rejected the change. This check shows that each member has
+# the new name.
+- name: Push | the config of each member binds the new name at {{ __server_cert_path.path }}
+  ansible.builtin.include_tasks: check_binds.yml
+  vars:
+    __server_cert_check_nodes: "{{ __server_cert_path.members }}"
+    __server_cert_check_fields: "{{ __server_cert_path.bind_fields }}"
+    __server_cert_check_name: "{{ __server_cert_path.name }}"
+
+# Only switch-cert sets what a node serves on server_cert_port.
+- name: Push | served certificate on each node, one node at a time, for {{ __server_cert_path.path }}
+  ansible.builtin.include_tasks: restart_node.yml
+  loop: "{{ __server_cert_path.nodes }}"
+  loop_control:
+    loop_var: __server_cert_node
+    label: "{{ __server_cert_node.name }}"
+  vars:
+    __server_cert_restart_name: "{{ __server_cert_path.name }}"
+  when: "'switch-cert' in __server_cert_path.bind_fields"
