@@ -1,23 +1,23 @@
 ---
 # A node normally restarts httpd by itself after the bind reaches it. The forced restart is the
 # fallback. A restart drops the web UI and the captive portal on this node for about 20 seconds.
-- name: Restart | wait for the store certificate on {{ __server_cert_node.name }}
+# A node can bind the current name and still serve another certificate after the restart. That node
+# gets a forced restart on every apply run, and each run fails until someone fixes the node.
+#
+# Each wait runs wait_store from main.yml. One probe can take up to 10 seconds.
+- name: Restart | wait up to 60 seconds for the store certificate on {{ __server_cert_node.name }}
   ansible.builtin.shell: |
-    set -o pipefail
-    timeout 10 openssl s_client -connect {{ (__server_cert_node.ip ~ ':' ~ server_cert_port) | quote }} \
-      -servername {{ server_cert_conductor | quote }} </dev/null 2>/dev/null | openssl x509 -fingerprint -sha256 -noout
+    {{ __server_cert_probe_fn }}
+    wait_store {{ (__server_cert_node.ip ~ ':' ~ server_cert_port) | quote }} {{ __server_cert_store_fp | quote }}
   args:
     executable: /bin/bash
   register: __server_cert_served
   changed_when: false
   failed_when: false
-  retries: 20  # measured 0-1s when the node restarts httpd by itself, ceiling 60s
-  delay: 3
-  until: (__server_cert_served.stdout | default('') | regex_replace('^.*Fingerprint=', '') | trim) == __server_cert_store_fp
 
 - name: Restart | served fingerprint of {{ __server_cert_node.name }}
   ansible.builtin.set_fact:
-    __server_cert_served_fp: "{{ __server_cert_served.stdout | default('') | regex_replace('^.*Fingerprint=', '') | trim }}"
+    __server_cert_served_fp: "{{ __server_cert_served.stdout | trim }}"
 
 # A restart cannot fix a closed port or a failed TLS handshake, so the role stops.
 - name: Restart | stop on an empty read from {{ __server_cert_node.name }}
@@ -52,17 +52,21 @@
   no_log: true
   when: __server_cert_served_fp != __server_cert_store_fp
 
-- name: Restart | the store certificate after the forced restart on {{ __server_cert_node.name }}
+# httpd needs about 20 seconds to come back.
+- name: Restart | wait up to 60 seconds for the store certificate after the forced restart on {{ __server_cert_node.name }}
   ansible.builtin.shell: |
-    set -o pipefail
-    timeout 10 openssl s_client -connect {{ (__server_cert_node.ip ~ ':' ~ server_cert_port) | quote }} \
-      -servername {{ server_cert_conductor | quote }} </dev/null 2>/dev/null | openssl x509 -fingerprint -sha256 -noout
+    {{ __server_cert_probe_fn }}
+    wait_store {{ (__server_cert_node.ip ~ ':' ~ server_cert_port) | quote }} {{ __server_cert_store_fp | quote }}
   args:
     executable: /bin/bash
   register: __server_cert_served_after
   changed_when: false
-  retries: 10  # measured ~20s for httpd to come back, ceiling 30s
-  delay: 3
-  until: (__server_cert_served_after.stdout | default('') | regex_replace('^.*Fingerprint=', '') | trim) == __server_cert_store_fp
-  failed_when: (__server_cert_served_after.stdout | default('') | regex_replace('^.*Fingerprint=', '') | trim) != __server_cert_store_fp
+  failed_when: false
   when: __server_cert_served_fp != __server_cert_store_fp
+
+- name: Restart | stop when the forced restart did not help on {{ __server_cert_node.name }}
+  ansible.builtin.fail:
+    msg: >-
+      {{ __server_cert_node.name }} ({{ __server_cert_node.ip }}) serves {{ (__server_cert_served_after.stdout | trim) or 'no certificate' }}
+      60 seconds after the forced restart. The store certificate has {{ __server_cert_store_fp }}.
+  when: __server_cert_served_fp != __server_cert_store_fp and (__server_cert_served_after.stdout | trim) != __server_cert_store_fp

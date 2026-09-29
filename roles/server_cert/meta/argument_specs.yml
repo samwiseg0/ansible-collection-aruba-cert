@@ -93,6 +93,7 @@ argument_specs:
             required: true
             description:
               - Last part of the ServerCert name. Letters and digits only. Each item needs a different suffix. The check ignores case.
+              - When a different certificate already holds the name, the role stops before any change. Change the suffix to push the certificate.
           bind_fields:
             type: list
             elements: str

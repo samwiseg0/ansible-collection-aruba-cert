@@ -58,7 +58,7 @@
   ansible.builtin.assert:
     that:
       - server_cert_scp_user is match('^[A-Za-z0-9._-]+\Z')
-      - server_cert_scp_password | length > 0
+      - server_cert_scp_password | regex_replace('[\\r\\n]+$', '') | length > 0
       - server_cert_scp_dir is match('^/[A-Za-z0-9_/.-]+\Z')
       - (server_cert_scp_delegate or server_cert_scp_host) is match('^[A-Za-z0-9][A-Za-z0-9._:-]*\Z')
     fail_msg: >-
@@ -76,18 +76,59 @@
     quiet: true
   when: server_cert_scp_user | length == 0
 
+# LogLevel=ERROR keeps the "Permanently added" warning of a first contact out of the output. The
+# role merges stderr into stdout, so the warning would break every parse of device output.
 - name: Facts | run mode and shared command parts
   ansible.builtin.set_fact:
     __server_cert_armed: "{{ server_cert_apply | bool and not ansible_check_mode }}"
     __server_cert_temp_mode: "{{ server_cert_scp_user | length == 0 }}"
     __server_cert_ssh: >-
-      sshpass -e ssh -l {{ server_cert_username | quote }}
+      sshpass -e ssh -l {{ server_cert_username | quote }} -o LogLevel=ERROR
       {{ ('-o UserKnownHostsFile=' ~ (server_cert_ssh_known_hosts | quote) ~ ' -o StrictHostKeyChecking=yes')
       if server_cert_ssh_known_hosts | length > 0 else '-o StrictHostKeyChecking=accept-new' }}
     __server_cert_cli_error: "(?i)invalid input|incomplete command|unknown command|% ?error|denied|not found|failed"
     __server_cert_base_url: "https://{{ server_cert_conductor }}:{{ server_cert_port }}"
     __server_cert_read_sshpass: >-
       IFS= read -r SSHPASS; [ -n "$SSHPASS" ] || { echo "The management password on stdin is empty."; exit 1; }; export SSHPASS
+    __server_cert_serial_py: |
+      import re, sys
+      m = re.search(r"Serial Number:\s*(?:\S+ \(0x)?([0-9A-Fa-f:]+)", sys.stdin.read())
+      print(m.group(1).replace(":", "").lower().lstrip("0") if m else "")
+
+# held <ip> <name> prints the serial number of the certificate that holds <name> on <ip>. It
+# prints "none" when the device prints nothing. A failed read, or output without a serial number,
+# returns 1. The device prints a long serial number on the next line as hex with colons, and a
+# short one as "<decimal> (0x<hex>)". The serial number loses case, colons and leading zeros.
+# probe <host:port> prints the fingerprint of the certificate that the address serves, or nothing.
+# wait_store <host:port> <fingerprint> probes every 3 seconds until the address serves that
+# fingerprint or 60 seconds pass. It prints the last fingerprint it read, or nothing when every
+# probe returned nothing.
+- name: Facts | shell functions
+  ansible.builtin.set_fact:
+    __server_cert_held_fn: |
+      held() {
+        local out ser
+        out=$(timeout 20 {{ __server_cert_ssh }} "$1" "show crypto-local pki serverCert $2" 2>&1) ||
+          { echo "the read failed with exit code $?: $out"; return 1; }
+        [ -n "$(tr -d '[:space:]' <<< "$out")" ] || { echo none; return 0; }
+        ser=$(python3 -c {{ __server_cert_serial_py | quote }} <<< "$out")
+        [ -n "$ser" ] || { echo "no serial number in the output: $(head -n 3 <<< "$out" | tr '\n' ' ')"; return 1; }
+        echo "$ser"
+      }
+    __server_cert_probe_fn: |
+      probe() {
+        timeout 10 openssl s_client -connect "$1" -servername {{ server_cert_conductor | quote }} </dev/null 2>/dev/null |
+          openssl x509 -fingerprint -sha256 -noout 2>/dev/null | sed 's/^.*Fingerprint=//'
+      }
+      wait_store() {
+        local end=$((SECONDS + 60)) fp='' new
+        while :; do
+          new=$(probe "$1"); [ -z "$new" ] || fp=$new
+          [ "$fp" != "$2" ] && [ $((SECONDS + 3)) -le $end ] || break
+          sleep 3
+        done
+        echo "$fp"
+      }
 
 # A secret with a trailing CR or LF would shift the next line that a script reads from stdin.
 - name: Facts | management password without a trailing CR or LF
@@ -209,20 +250,6 @@
   ansible.builtin.set_fact:
     __server_cert_topology: "{{ __server_cert_topology_raw.stdout | from_json }}"
 
-# This read is for the report only. A node serves a new certificate only after httpd restarts, so
-# the served certificate can lag the config. The push decision reads the config.
-- name: Report | served fingerprint on the conductor
-  ansible.builtin.shell: |
-    set -o pipefail
-    timeout 10 openssl s_client -connect {{ (server_cert_conductor ~ ':' ~ server_cert_port) | quote }} \
-      -servername {{ server_cert_conductor | quote }} </dev/null 2>/dev/null | openssl x509 -fingerprint -sha256 -noout
-  args:
-    executable: /bin/bash
-  register: __server_cert_conductor_served
-  changed_when: false
-  failed_when: false
-  check_mode: false
-
 - name: Report | read the current binds
   ansible.builtin.include_tasks: read_binds.yml
   vars:
@@ -259,14 +286,17 @@
     __server_cert_any_push: "{{ __server_cert_state | selectattr('push') | list | length > 0 }}"
 
 # The conductor shows the material of /mm. Only a member shows the material of an /md path. The
-# first node of a path is the master for /mm and a member for /md, so the role reads it there. An
-# empty read means that no certificate holds the name yet.
+# role reads it on the nodes of the path in order, and the first node that answers decides. The
+# last output line is the serial number, or "none" when no certificate holds the name yet.
 - name: Report | read the certificate that holds each name
   ansible.builtin.shell: |
-    set -o pipefail
     {{ __server_cert_read_sshpass }}
-    timeout 20 {{ __server_cert_ssh }} {{ item.nodes[0].ip | quote }} \
-      {{ ('show crypto-local pki serverCert ' ~ item.name) | quote }} 2>&1
+    {{ __server_cert_held_fn }}
+    {% for node in item.nodes %}
+    if R=$(held {{ node.ip | quote }} {{ item.name | quote }}); then echo "$R"; exit 0; fi
+    echo {{ node.name | quote }}": $R"
+    {% endfor %}
+    exit 1
   args:
     executable: /bin/bash
     stdin: "{{ __server_cert_pass }}"
@@ -279,32 +309,62 @@
   check_mode: false
   no_log: true
 
-- name: Report | stop when a certificate read failed
+- name: Report | stop when no node answered the certificate read
   ansible.builtin.fail:
     msg: >-
-      {% for r in __server_cert_held.results | rejectattr('rc', 'eq', 0) %}{{ r.item.nodes[0].name }}:
-      show crypto-local pki serverCert {{ r.item.name }} failed: {{ r.stdout }} {% endfor %}
+      {% for r in __server_cert_held.results | rejectattr('rc', 'eq', 0) %}{{ r.item.path }}: no node answered
+      show crypto-local pki serverCert {{ r.item.name }}. {{ r.stdout_lines | join(' ') }} {% endfor %}
   when: __server_cert_held.results | rejectattr('rc', 'eq', 0) | list | length > 0
 
-# The device prints a long serial number on the next line as hex with colons. It prints a short one
-# as "<decimal> (0x<hex>)". The compare ignores case, colons and leading zeros.
 - name: Report | paths where a different certificate holds the name
   ansible.builtin.set_fact:
     __server_cert_collisions: >-
       {{ __server_cert_held.results | map(attribute='item.path')
-         | zip(__server_cert_held.results | map(attribute='stdout')
-               | map('regex_search', 'Serial Number:\s*(?:\S+ \(0x)?([0-9A-Fa-f:]+)', '\1') | map('default', [''], true) | map('first')
-               | map('replace', ':', '') | map('lower') | map('regex_replace', '^0+', ''))
-         | rejectattr('1', 'eq', '') | rejectattr('1', 'eq', __server_cert_store_serial) | map(attribute='0') | list }}
+         | zip(__server_cert_held.results | map(attribute='stdout_lines') | map('last'))
+         | rejectattr('1', 'eq', 'none') | rejectattr('1', 'eq', __server_cert_store_serial) | map(attribute='0') | list }}
+
+# This probe is read-only. A node that serves another certificate on all 3 attempts, 5 seconds
+# apart, is a node that an apply run would restart.
+- name: Report | served certificate on each node of each path with switch-cert
+  ansible.builtin.shell: |
+    {{ __server_cert_probe_fn }}
+    FP=''
+    for i in 1 2 3; do
+      NEW=$(probe {{ (item.1.ip ~ ':' ~ server_cert_port) | quote }}); [ -z "$NEW" ] || FP=$NEW
+      [ "$FP" = {{ __server_cert_store_fp | quote }} ] && break
+      [ "$i" = 3 ] || sleep 5
+    done
+    echo "$FP"
+  args:
+    executable: /bin/bash
+  register: __server_cert_served_report
+  loop: "{{ __server_cert_state | selectattr('bind_fields', 'contains', 'switch-cert') | subelements('nodes') }}"
+  loop_control:
+    label: "{{ item.1.name }}"
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: not __server_cert_armed
 
 - name: Report | state per path
   ansible.builtin.debug:
     msg: |
       {{ item.path }} {{ item.bind_fields | join(' + ') }}: bound {{ item.bind_fields | map('extract', item.current) | list }},
         master {{ item.master.name if item.master else 'n/a' }}, members {{ item.members | map(attribute='name') | list }},
-        served on the conductor (report only) {{ (__server_cert_conductor_served.stdout | regex_replace('^.*Fingerprint=', '') | trim) or 'UNREACHABLE' }},
-        {{ (('name current' if not item.push else item.name ~ ' exists') ~ ', but a different certificate holds it; change the suffix to push this one')
+        served: {{ __server_cert_served_text }},
+        {{ (('name current' if not item.push else item.name ~ ' exists') ~ ', but a different certificate holds it. Change the suffix to push this one.')
            if item.path in __server_cert_collisions else ('would push ' ~ item.name if item.push else 'current') }}
+  vars:
+    __server_cert_probes: "{{ __server_cert_served_report.results | default([]) | selectattr('item.0.path', 'eq', item.path) | list }}"
+    __server_cert_other: "{{ __server_cert_probes | rejectattr('stdout', 'in', [__server_cert_store_fp, '']) | map(attribute='item.1.name') | list }}"
+    __server_cert_silent: "{{ __server_cert_probes | selectattr('stdout', 'eq', '') | map(attribute='item.1.name') | list }}"
+    __server_cert_served_text: >-
+      {{ 'not checked, the path does not bind switch-cert' if 'switch-cert' not in item.bind_fields
+         else ((['an apply run ' ~ ('may' if item.push else 'would') ~ ' restart httpd on ' ~ (__server_cert_other | join(', '))
+                  ~ ', or stop when ' ~ (__server_cert_other | join(', ')) ~ (' binds' if __server_cert_other | length == 1 else ' bind')
+                  ~ ' another name'] if __server_cert_other else [])
+               + ([(__server_cert_silent | join(', ')) ~ ' returned no certificate, so an apply run would stop there']
+                 if __server_cert_silent else [])) | join('. ') or 'every node serves the store certificate' }}
   loop: "{{ __server_cert_state }}"
   loop_control:
     label: "{{ item.path }}"

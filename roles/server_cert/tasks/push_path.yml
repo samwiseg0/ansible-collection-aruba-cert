@@ -296,12 +296,15 @@
   vars:
     __server_cert_gate_ips: "{{ __server_cert_path.nodes | map(attribute='ip') | list }}"
 
+# The last output line is the serial number of the material under the new name. The check waits
+# for the material, and then compares its serial number with the store certificate.
 - name: Push | read the certificate material on each member for {{ __server_cert_path.path }}
   ansible.builtin.shell: |
-    set -o pipefail
     {{ __server_cert_read_sshpass }}
-    timeout 20 {{ __server_cert_ssh }} {{ item.ip | quote }} \
-      {{ ('show crypto-local pki serverCert ' ~ __server_cert_path.name) | quote }} 2>&1
+    {{ __server_cert_held_fn }}
+    R=$(held {{ item.ip | quote }} {{ __server_cert_path.name | quote }}) || { echo "$R"; exit 1; }
+    [ "$R" != none ] || { echo {{ ('no ServerCert ' ~ __server_cert_path.name) | quote }}; exit 1; }
+    echo "$R"
   args:
     executable: /bin/bash
     stdin: "{{ __server_cert_pass }}"
@@ -314,14 +317,22 @@
   no_log: true
   retries: 30  # measured ~1s, ceiling 300s
   delay: 10
-  until: "'Version:' in (__server_cert_material.stdout | default(''))"
+  until: __server_cert_material.rc == 0
 
 - name: Push | stop before the bind when a member lacks the material for {{ __server_cert_path.path }}
   ansible.builtin.fail:
     msg: >-
-      {{ __server_cert_material.results | rejectattr('stdout', 'search', 'Version:') | map(attribute='item.name') | join(', ') }}
-      has no ServerCert {{ __server_cert_path.name }} after the register step. The role stopped before the bind.
-  when: __server_cert_material.results | rejectattr('stdout', 'search', 'Version:') | list | length > 0
+      {% for r in __server_cert_material.results | rejectattr('rc', 'eq', 0) %}{{ r.item.name }}: {{ r.stdout }}.
+      {% endfor %}The register step did not deliver {{ __server_cert_path.name }}. The role stopped before the bind.
+  when: __server_cert_material.results | rejectattr('rc', 'eq', 0) | list | length > 0
+
+- name: Push | stop before the bind when a member holds other material for {{ __server_cert_path.path }}
+  ansible.builtin.fail:
+    msg: >-
+      {% for r in __server_cert_material.results | rejectattr('stdout', 'eq', __server_cert_store_serial) %}{{ r.item.name }}
+      holds serial number {{ r.stdout }} under {{ __server_cert_path.name }}. {% endfor %}The store certificate has serial number
+      {{ __server_cert_store_serial }}. The role stopped before the bind.
+  when: __server_cert_material.results | rejectattr('stdout', 'eq', __server_cert_store_serial) | list | length > 0
 
 - name: Push | bind the certificate at {{ __server_cert_path.path }}
   ansible.builtin.shell: |

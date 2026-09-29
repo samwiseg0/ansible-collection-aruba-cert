@@ -12,8 +12,10 @@ The `server_cert` role runs on the control node. It works on each config path yo
 
 1. It discovers the cluster nodes from the conductor. It stops if a path has no nodes, or if a
    node of a path is missing from `show switches`.
-2. It reads the current binds over the REST API and reports each path as `current` or
-   `would push`.
+2. It reads the current binds over the REST API. It reads the serial number of the certificate
+   that holds each name over ssh from a node of the path. On each path that binds `switch-cert`,
+   it reads the certificate that each node serves. It reports each path as `current` or
+   `would push`. It also names the nodes that an apply run would restart.
 3. With `server_cert_apply: true`, it also writes to the cluster.
    - It stops if the cluster has not converged.
    - It builds a PKCS12 file (p12), and the conductor pulls the p12 over scp.
@@ -23,6 +25,9 @@ The `server_cert` role runs on the control node. It works on each config path yo
    - On each path that binds `switch-cert`, it checks that every node serves the new
      certificate. A node normally restarts httpd by itself. The role forces a restart only on a
      node that serves an old certificate and whose config binds the current name.
+   - A node can bind the current name and still serve another certificate after the restart.
+     That node gets a forced restart on every apply run, and each run fails until someone fixes
+     the node.
    - It deletes old unbound certificates that carry your name prefix. It first checks every
      node for a reference to the name.
 
@@ -56,7 +61,7 @@ The role does not issue certificates. Give it PEM files from any source.
 ## Install
 
 ```bash
-ansible-galaxy collection install git+https://github.com/samwiseg0/ansible-collection-aruba-cert.git,v1.0.0
+ansible-galaxy collection install git+https://github.com/samwiseg0/ansible-collection-aruba-cert.git,v1.0.1
 ```
 
 You can also list the collection in a `requirements.yml` file.
@@ -65,7 +70,7 @@ You can also list the collection in a `requirements.yml` file.
 collections:
   - name: https://github.com/samwiseg0/ansible-collection-aruba-cert.git
     type: git
-    version: v1.0.0
+    version: v1.0.1
 ```
 
 Then run `ansible-galaxy collection install -r requirements.yml`. Both forms need git on the
@@ -189,9 +194,10 @@ certificate. Set `server_cert_ca_path` when your CA is not in the system trust s
 A private predecessor of this role proved the device workflow on hardware. The cluster was a
 Mobility Conductor pair and two Mobility Controllers in one group, on ArubaOS 8.13.1.2 LSR. The
 management user had the `root` role. The predecessor sent CLI input through heredocs. This release
-sends it with printf on stdin. That input path ran only against a mock. The report mode of this
-release ran read-only on ArubaOS 8.13.3.0. The remote scp host mode and the `master` row type of
-older AOS 8 releases are untested.
+sends it with printf on stdin. That input path ran only against a mock. The report mode of
+releases 1.0.0 and 1.0.1 ran read-only on ArubaOS 8.13.3.0, with the serial number read. The
+1.0.1 run also probed the certificate that each node serves. The remote scp host mode and the
+`master` row type of older AOS 8 releases are untested.
 
 ## License
 

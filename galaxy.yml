@@ -1,7 +1,7 @@
 ---
 namespace: samwiseg0
 name: aruba_cert
-version: 1.0.0
+version: 1.0.1
 readme: README.md
 authors:
   - samwiseg0
